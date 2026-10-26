@@ -2,6 +2,7 @@
 title: add-ClusterImagePolicy-and-ImagePolicy-for-Signature-Verification
 authors:
   - "@QiWang19"
+  - "@aksjadha"
 reviewers: # Include a comment about what domain expertise a reviewer is expected to bring and what area of the enhancement you expect them to focus on. For example: - "@networkguru, for networking aspects, please look at IP bootstrapping aspect"
   - "@saschagrunert, for API design, implementation details and graduation criteria"
   - "@mrunalp"
@@ -16,12 +17,12 @@ api-approvers: # In case of new or modified APIs or API extensions (CRDs, aggreg
   - "@mrunalp"
   - "@JoelSpeed"
 creation-date: 2023-05-17
-last-updated: 2024-05-02
+last-updated: 2026-10-13
 tracking-link: # link to the tracking ticket (for example: Jira Feature or Epic ticket) that corresponds to this enhancement
-  - https://issues.redhat.com/browse/OCPNODE-1628
+  - https://redhat.atlassian.net/browse/OCPNODE-4756
 ---
 
-# Add CRD ImagePolicy to config.openshift.io/v1alpha1
+# Add CRD ImagePolicy to config.openshift.io/v1
 
 ## Summary
 
@@ -74,7 +75,7 @@ Please note that the application administrator cannot override cluster-scoped po
 3. The application administrator can retrieve the cluster override and merged policies by checking `<NAMESPACE>.json` within the `99-<pool>-generated-registries` machine-config.
 4. The application administrator has the option to remove the signature verification configuration by deleting its ImagePolicy instances.
 
-**Note:** The same workflows apply for deny-by-default policies by setting `appliesTo: Default` with `policyType: Reject` (representing default policy for all images), or `policyType: InsecureAcceptAnything` to explicitly allow images without verification.
+**Note:** The same workflows apply for deny-by-default policies by setting `appliesTo: Default` with `policyType: Reject` (representing default policy for all images). Registry-specific policies can use any policy type including `InsecureAcceptAnything` to explicitly allow images from specific registries without verification.
 
 ### API Extensions
 
@@ -88,9 +89,8 @@ Type definitions of ImagePolicy. ClusterImagePolicy is expected to have a simila
 
 // ImagePolicy holds namespace-wide configuration for image signature verification
 //
-// Compatibility level 4: No compatibility is provided, the API can change at any point for any reason. These capabilities should not be used by applications needing long term support.
-// +openshift:compatibility-gen:level=4
-// +openshift:enable:FeatureSets=TechPreviewNoUpgrade
+// Compatibility level 1: Stable within a major release for a minimum of 12 months or 3 minor releases (whichever is longer).
+// +openshift:compatibility-gen:level=1
 type ImagePolicy struct {
 	metav1.TypeMeta `json:",inline"`
 
@@ -107,14 +107,15 @@ type ImagePolicy struct {
 }
 
 // ImagePolicySpec is the specification of the ImagePolicy CRD.
-// +kubebuilder:validation:XValidation:rule="(!has(self.appliesTo) || self.appliesTo == 'Registries') ? ((has(self.registries) && size(self.registries) > 0) || (has(self.scopes) && size(self.scopes) > 0)) : (!has(self.registries) && !has(self.scopes))",message="registries or scopes must be specified when appliesTo is Registries or omitted, and both must be empty when appliesTo is Default"
-// +kubebuilder:validation:XValidation:rule="!(has(self.registries) && size(self.registries) > 0 && has(self.scopes) && size(self.scopes) > 0)",message="registries and scopes are mutually exclusive, specify only one"
+// +openshift:validation:FeatureGateAwareXValidation:featureGate=ImagePolicyDenyByDefault,rule="(!has(self.appliesTo) || self.appliesTo == 'Registries') ? (has(self.scopes) && size(self.scopes) > 0) : !has(self.scopes)",message="scopes must be specified when appliesTo is Registries or omitted, and must be empty when appliesTo is Default"
+// +openshift:validation:FeatureGateAwareXValidation:featureGate=ImagePolicyDenyByDefault,rule="!has(self.appliesTo) || self.appliesTo != 'Default' || self.policy.rootOfTrust.policyType == 'Reject'",message="appliesTo Default requires policyType Reject"
 type ImagePolicySpec struct {
+	// +openshift:enable:FeatureGate=ImagePolicyDenyByDefault
 	// appliesTo specifies whether this policy applies as a default for all images or to specific registry scopes.
 	// Valid values are "Default" and "Registries".
 	// When set to "Default", the policy acts as a fallback for images that do not match any registry-specific policies.
 	// This maps to the policy.json "default" entry.
-	// When set to "Registries" or omitted, the policy applies only to registries specified in the scopes or registries field.
+	// When set to "Registries" or omitted, the policy applies only to registries specified in the scopes field.
 	// +optional
 	// +kubebuilder:validation:Enum=Default;Registries
 	AppliesTo AppliesTo `json:"appliesTo,omitempty"`
@@ -127,17 +128,10 @@ type ImagePolicySpec struct {
 	// If configured, the policies for OCP repositories will not be in effect.
 	// For additional details about the format, please refer to the document explaining the docker transport field,
 	// which can be found at: https://github.com/containers/image/blob/main/docs/containers-policy.json.5.md#docker
-	// Deprecated: Use registries instead. This field is mutually exclusive with registries and will be removed in a future API version.
 	// +optional
 	// +kubebuilder:validation:MaxItems=256
 	// +listType=set
 	Scopes []ImageScope `json:"scopes,omitempty"`
-	// registries defines the list of registry scopes to which this policy applies. Preferred over the deprecated scopes field.
-	// The format is identical to scopes. Mutually exclusive with scopes.
-	// +optional
-	// +kubebuilder:validation:MaxItems=256
-	// +listType=set
-	Registries []ImageScope `json:"registries,omitempty"`
 	// policy defines the verification policy for the items in the scopes list
 	// +kubebuilder:validation:Required
 	Policy Policy `json:"policy"`
@@ -159,7 +153,7 @@ const (
 type ImageScope string
 
 // Policy defines the verification policy for the items in the scopes list.
-// +kubebuilder:validation:XValidation:rule="!(self.rootOfTrust.policyType in ['Reject', 'InsecureAcceptAnything']) || !has(self.signedIdentity)",message="signedIdentity must not be set when policyType is Reject or InsecureAcceptAnything"
+// +openshift:validation:FeatureGateAwareXValidation:featureGate=ImagePolicyDenyByDefault,rule="!(self.rootOfTrust.policyType in ['Reject', 'InsecureAcceptAnything']) || !has(self.signedIdentity)",message="signedIdentity must not be set when policyType is Reject or InsecureAcceptAnything"
 type Policy struct {
 	// rootOfTrust specifies the root of trust for the policy.
 	// +kubebuilder:validation:Required
@@ -177,14 +171,14 @@ type Policy struct {
 // +kubebuilder:validation:XValidation:rule="has(self.policyType) && self.policyType == 'PublicKey' ? has(self.publicKey) : !has(self.publicKey)",message="publicKey is required when policyType is PublicKey, and forbidden otherwise"
 // +kubebuilder:validation:XValidation:rule="has(self.policyType) && self.policyType == 'FulcioCAWithRekor' ? has(self.fulcioCAWithRekor) : !has(self.fulcioCAWithRekor)",message="fulcioCAWithRekor is required when policyType is FulcioCAWithRekor, and forbidden otherwise"
 // +kubebuilder:validation:XValidation:rule="has(self.policyType) && self.policyType == 'PKI' ? has(self.pki) : !has(self.pki)",message="pki is required when policyType is PKI, and forbidden otherwise"
-// +kubebuilder:validation:XValidation:rule="!(self.policyType in ['Reject', 'InsecureAcceptAnything']) || (!has(self.publicKey) && !has(self.fulcioCAWithRekor) && !has(self.pki))",message="publicKey, fulcioCAWithRekor, and pki must not be set when policyType is Reject or InsecureAcceptAnything"
+// +openshift:validation:FeatureGateAwareXValidation:featureGate=ImagePolicyDenyByDefault,rule="!(self.policyType in ['Reject', 'InsecureAcceptAnything']) || (!has(self.publicKey) && !has(self.fulcioCAWithRekor) && !has(self.pki))",message="publicKey, fulcioCAWithRekor, and pki must not be set when policyType is Reject or InsecureAcceptAnything"
 type PolicyRootOfTrust struct {
 	// policyType serves as the union's discriminator. Users are required to assign a value to this field, choosing one of the policy types.
 	// "PublicKey" indicates that the policy relies on a sigstore publicKey and may optionally use a Rekor verification.
 	// "FulcioCAWithRekor" indicates that the policy is based on the Fulcio certification and incorporates a Rekor verification.
 	// "PKI" indicates that the policy relies on a PKI root of trust with optional intermediate certificates.
-	// "Reject" indicates that all images matching the policy scopes will be rejected.
-	// "InsecureAcceptAnything" indicates that all images matching the policy scopes will be accepted without verification.
+	// "Reject" indicates that all images matching the policy scopes will be rejected. This value is available only when the ImagePolicyDenyByDefault feature gate is enabled.
+	// "InsecureAcceptAnything" indicates that all images matching the policy scopes will be accepted without verification. This value is available only when the ImagePolicyDenyByDefault feature gate is enabled.
 	// +unionDiscriminator
 	// +kubebuilder:validation:Required
 	PolicyType PolicyType `json:"policyType"`
@@ -203,13 +197,16 @@ type PolicyRootOfTrust struct {
 }
 
 // +kubebuilder:validation:Enum=PublicKey;FulcioCAWithRekor;PKI;Reject;InsecureAcceptAnything
+// +openshift:validation:FeatureGateAwareEnum:featureGate=ImagePolicyDenyByDefault,enum=Reject;InsecureAcceptAnything
 type PolicyType string
 
 const (
 	PublicKeyRootOfTrust         PolicyType = "PublicKey"
 	FulcioCAWithRekorRootOfTrust PolicyType = "FulcioCAWithRekor"
 	PKIRootOfTrust               PolicyType = "PKI"
+	// +openshift:enable:FeatureGate=ImagePolicyDenyByDefault
 	RejectPolicyType             PolicyType = "Reject"
+	// +openshift:enable:FeatureGate=ImagePolicyDenyByDefault
 	InsecureAcceptAnythingType   PolicyType = "InsecureAcceptAnything"
 )
 
@@ -364,25 +361,29 @@ type ImagePolicyStatus struct {
 
 The deny-by-default functionality is gated behind the `ImagePolicyDenyByDefault` feature gate, enabled in `TechPreviewNoUpgrade` and `DevPreviewNoUpgrade` feature sets.
 
-#### Feature-Gated Fields
-- `appliesTo` - Controls whether policy is default or registry-specific
-- `registries` - Preferred field for specifying registry scopes (replaces deprecated `scopes`)
+#### Feature-Gated Enhancements
 
-#### Ungated Enhancements
-- `Reject` and `InsecureAcceptAnything` policy types are added to the `PolicyType` enum and are available in all feature sets (Default, TechPreview, DevPreview, OKD)
+All new features are behind the `ImagePolicyDenyByDefault` feature gate:
+
+- **appliesTo field** (`+openshift:enable:FeatureGate=ImagePolicyDenyByDefault`) - Controls whether policy is default or registry-specific
+- **Reject and InsecureAcceptAnything enum values** (`+openshift:validation:FeatureGateAwareEnum:featureGate=ImagePolicyDenyByDefault`) - New policy types in the `PolicyType` enum
+- **CEL validation rules** (`+openshift:validation:FeatureGateAwareXValidation:featureGate=ImagePolicyDenyByDefault`) - Validation rules that reference feature-gated fields
 
 #### Backward Compatibility
-When the feature gate is disabled:
-- The `appliesTo` and `registries` fields are not present in the CRD schema
+
+**When the feature gate is not enabled:**
+- The `appliesTo` field is not present in the CRD schema
+- The `scopes` field is required (not optional)
 - Existing resources using the `scopes` field continue to work unchanged
-- Only the original three policy types (`PublicKey`, `FulcioCAWithRekor`, `PKI`) are available
+- Only the original three policy types are available: `PublicKey`, `FulcioCAWithRekor`, `PKI`
+- CEL validation rules that reference `appliesTo` are not active
 
-When the feature gate is enabled:
-- Resources can use either `scopes` (deprecated) or `registries` fields, but not both
-- The `appliesTo` field defaults to `Registries` when omitted for backward compatibility
-- All five policy types are available (`PublicKey`, `FulcioCAWithRekor`, `PKI`, `Reject`, `InsecureAcceptAnything`)
-
-**Note:** The `registries` field will be used in future versions. For now, examples in this document use `scopes` to maintain consistency with existing deployments, but administrators should plan to migrate to `registries` when updating policies.
+**When the feature gate is enabled:**
+- The `appliesTo` field becomes available and defaults to `Registries` when omitted for backward compatibility
+- The `scopes` field becomes optional when `appliesTo` is `Default`, and required when `appliesTo` is `Registries` or omitted
+- All five policy types are available: `PublicKey`, `FulcioCAWithRekor`, `PKI`, `Reject`, `InsecureAcceptAnything`
+- CEL validation rules enforce constraints on `appliesTo` and policy type combinations
+- When `appliesTo` is `Default`, only `policyType: Reject` is allowed
 
 ### Implementation Details/Notes/Constraints [optional]
 
@@ -403,16 +404,11 @@ Enhance the MCO container runtime config controller to manage ClusterImagePolicy
         use-sigstore-attachments: true
     ```
 
-    Alternatively, we can enable it node wide:
-
-    ```yaml
-    default-docker:
-      use-sigstore-attachments: true
-    ```
+    Note: The MCO writes per-scope entries only. For policies with `appliesTo: Default`, only `policyType: Reject` is supported because it does not require signature lookups.
 - Converts ClusterImagePolicy and ImagePolicy CRs to policy.json format:
   - **Scope mapping**: 
     - `appliesTo: Default` maps to the top-level `"default"` key in policy.json
-    - `appliesTo: Registries` (or omitted) with `scopes`/`registries` fields map to `"transports": {"docker": {"<scope>": [...]}}` in policy.json
+    - `appliesTo: Registries` (or omitted) with `scopes` field maps to `"transports": {"docker": {"<scope>": [...]}}` in policy.json
   - **PolicyType conversion**:
     - `policyType: PublicKey` → `{"type": "sigstoreSigned", "keyData": "...", ...}`
     - `policyType: FulcioCAWithRekor` → `{"type": "sigstoreSigned", "fulcio": {...}, ...}`
@@ -421,9 +417,10 @@ Enhance the MCO container runtime config controller to manage ClusterImagePolicy
     - `policyType: InsecureAcceptAnything` → `{"type": "insecureAcceptAnything"}`
 - Special handling for default policies (`appliesTo: Default`):
   - When a ClusterImagePolicy uses `appliesTo: Default`, it is treated as the broadest possible scope covering ALL registries and images
-  - Any ImagePolicy scope (e.g., `quay.io`, `docker.io`, or any specific registry) is considered to nest inside the cluster's default policy
-  - Therefore, ImagePolicy CRs cannot weaken a cluster-wide default policy; the namespace policy will be ignored and the cluster policy takes precedence
-  - This ensures application administrators cannot override cluster-wide deny-by-default policies, preserving the security boundary
+  - **All namespace-scoped ImagePolicies are ignored** when a cluster default policy exists, regardless of their scopes or whether they would tighten or weaken security
+  - Ignored ImagePolicies receive a `Pending` status condition indicating the policy is not applied
+  - This ensures application administrators cannot weaken cluster-wide deny-by-default policies, preserving the security boundary
+  - **Note:** This means creating any cluster default policy disables signature verification policies in all namespaces
 - Merge rule for ClusterImagePolicy and ImagePolicy CRs:
   - when the syncHandler processing an image scope within a ClusterImagePolicy CR
     - the scope exists in an existing ClusterImagePolicy CR:
@@ -444,7 +441,7 @@ Enhance the MCO container runtime config controller to manage ClusterImagePolicy
     - If blockedRegistries exists, ClusterImagePolicy with `appliesTo: Registries` must not equal or be nested under a blocked registry.
     - If allowedRegistries exists, ClusterImagePolicy with `appliesTo: Registries` must be nested under an allowed registry.
     - When ClusterImagePolicy registry scope matches an Image CR allowed registry, ClusterImagePolicy replaces the `insecureAcceptAnything` entry, enabling signature verification or explicit rejection
-    - ClusterImagePolicy with `appliesTo: Default` overwrites the Image CR's default policy. With `blockedRegistries` (allow-by-default), this enables deny-by-default by setting `policyType: Reject`. With `allowedRegistries` (deny-by-default), MCO validation prevents weakening by rejecting `policyType: InsecureAcceptAnything`
+    - ClusterImagePolicy with `appliesTo: Default` overwrites the Image CR's default policy and must use `policyType: Reject` (enforced by CEL validation). This enables deny-by-default for all images not matching any registry-specific scope.
   - the `/etc/containers/policy.json` holds the cluster wide policy. `\<NAMESPACE\>.json` holds the merged cluster override policy and namespaced policy.
 - Image policies that are written to `/etc/containers/policy.json` will be rolled out by machine config `99-<pool>-generated-registries`.
 
@@ -453,16 +450,16 @@ Enhance the MCO container runtime config controller to manage ClusterImagePolicy
 #### Scope Precedence
 1. Most specific scope wins (e.g., `quay.io/namespace/repo` > `quay.io/namespace` > `quay.io`)
 2. ClusterImagePolicy > ImagePolicy for the same scope
-3. Default policies (`appliesTo: Default`) only apply to images not matching any registry-specific policy
+3. Cluster default policies (`appliesTo: Default`) only apply to images not matching any ClusterImagePolicy registry-specific scope
 
 #### Policy Type Compatibility
 
 When multiple policies target the same scope:
 
 **Compatible Types (Merge):**
-- Signature verification types (`PublicKey`, `FulcioCAWithRekor`, `PKI`) can coexist
-- Images must satisfy at least one of the configured signing authorities
-- Example: Two `PublicKey` policies allow images signed by either key
+- Signature verification types (`PublicKey`, `FulcioCAWithRekor`, `PKI`) can coexist for registry-specific scopes
+- Images must satisfy all of the configured signing authorities (policy.json requirements are ANDed)
+- Example: Two `PublicKey` policies targeting the same registry scope require images to be signed by both keys
 
 **Incompatible Types (Rollout Failure):**
 - `Reject` and `InsecureAcceptAnything` are only compatible with themselves
@@ -472,21 +469,25 @@ When multiple policies target the same scope:
 #### Default Policy Precedence
 
 **Multiple Defaults in Same Namespace:**
-- Compatible policy types merge (e.g., two `PublicKey` ImagePolicies with `appliesTo: Default`)
-- Incompatible types cause rollout failure with clear error message
+- Multiple ImagePolicies with `appliesTo: Default` in the same namespace are allowed since they all use `policyType: Reject` (enforced by CEL validation)
+- Multiple Reject defaults are redundant but not an error (they all produce the same policy.json result)
 
 **Cluster vs Namespace Defaults:**
-- ClusterImagePolicy with `appliesTo: Default` takes full precedence
-- All namespace-scoped ImagePolicy defaults are ignored when cluster default exists
+- ClusterImagePolicy with `appliesTo: Default` takes full precedence over ALL namespace-scoped ImagePolicies
+- When a cluster default exists, **every** namespace-scoped ImagePolicy (both default and scoped) is ignored, regardless of whether it would tighten or weaken security
+- Ignored namespace ImagePolicies are marked with a `Pending` status condition indicating they are not applied
+- This ensures application administrators cannot weaken cluster-wide deny-by-default policies, preserving the security boundary
 
 ### Policy Type Compatibility Validation
 
-Multiple ClusterImagePolicy resources targeting the same scope or default policy must use compatible policy types. Signature verification types (PublicKey, FulcioCAWithRekor, PKI) are compatible and can coexist to support multiple signing authorities. The Reject and InsecureAcceptAnything types are only compatible with themselves.
+Multiple ClusterImagePolicy resources targeting the same registry scope must use compatible policy types. Signature verification types (PublicKey, FulcioCAWithRekor, PKI) are compatible and can coexist, with all signing requirements ANDed together (images must satisfy all policies). The Reject and InsecureAcceptAnything types are only compatible with themselves.
+
+For default policies (`appliesTo: Default`), only `policyType: Reject` is allowed (enforced by CEL validation), so multiple default policies are always compatible but redundant (they all produce the same policy.json result).
 
 The MCO controller merges policies from multiple ClusterImagePolicy resources:
-- Multiple ClusterImagePolicies with `appliesTo: Default` are merged if they have compatible policy types
+- Multiple ClusterImagePolicies with `appliesTo: Default` are allowed and always compatible (all must use `policyType: Reject`)
 - Multiple ClusterImagePolicies targeting the same registry scope are merged if they have compatible policy types
-- Incompatible policy types targeting the same scope or default policy will cause the rollout to fail
+- Incompatible policy types targeting the same registry scope will cause the rollout to fail
 
 The same validation applies to ImagePolicy resources within a namespace.
 
@@ -598,8 +599,6 @@ spec:
 **Example: Deny-by-Default with Allowed Registries**
 
 > **Note:** This example uses ClusterImagePolicy alone. If Image CR `allowedRegistries` is also configured, ClusterImagePolicy scopes must be nested inside the allowed registries. When both target the same scope, ClusterImagePolicy replaces Image CR's `insecureAcceptAnything`, enabling signature verification enforcement.
->
-> **Field Usage Note:** These examples use the `scopes` field for backward compatibility. The `registries` field is preferred and should be used in future configurations. The two fields are mutually exclusive.
 
 ```yaml
 # Allow Red Hat registries without verification - these policies are evaluated first by scope specificity
@@ -628,7 +627,7 @@ spec:
 
 **Example: Namespace-Scoped Deny-by-Default (Without Cluster-Wide Deny)**
 
-> **Note:** This example assumes NO cluster-wide deny-by-default policy exists. If a ClusterImagePolicy with `appliesTo: Default` exists, it takes precedence and namespace policies cannot weaken it. Similarly, if Image CR `allowedRegistries` is configured, namespace ImagePolicy scopes must nest inside the allowed registries.
+> **Note:** This example assumes NO cluster-wide deny-by-default policy exists. If a ClusterImagePolicy with `appliesTo: Default` exists, **all** namespace-scoped ImagePolicies are ignored and marked Pending, regardless of their configuration. Similarly, if Image CR `allowedRegistries` is configured, namespace ImagePolicy scopes must nest inside the allowed registries.
 
 ```yaml
 # Deny all images by default in the production namespace only
@@ -694,7 +693,7 @@ The deny-by-default ClusterImagePolicy example above will generate the following
 }
 ```
 
-For the `production` namespace with the namespace-scoped deny-by-default policy, the following `/path/to/policies/production.json` will be generated:
+For the `production` namespace with the namespace-scoped deny-by-default policy (assuming the `allow-redhat-registries` ClusterImagePolicy exists but no cluster-level `default-reject`), the following `/path/to/policies/production.json` will be generated:
 
 ```json
 {
@@ -736,6 +735,12 @@ For the `production` namespace with the namespace-scoped deny-by-default policy,
   }
 }
 ```
+
+**Explanation:**
+- `"default": reject` - From the namespace-scoped `default-reject` ImagePolicy
+- `registry.redhat.io`, `quay.io/openshift-release-dev` - From the cluster-scoped `allow-redhat-registries` ClusterImagePolicy
+- `image-registry.openshift-image-registry.svc:5000` - From the cluster-scoped `allow-redhat-registries` ClusterImagePolicy. The namespace `allow-internal-registry` ImagePolicy also targets this scope, so it is marked `Pending` (cluster policy takes precedence per L435)
+- `quay.example.com/production` - From the namespace-scoped `allow-internal-registry` ImagePolicy
 
 Feedback from the container runtime config controller:
 
@@ -882,11 +887,37 @@ Risk: The ClusterImagePolicy and ImagePolicy policies overwrite
 
 Mitigation: The [Implementation Details](#Update-container-runtime-config-controller-to-watch-ClusterImagePolicy-and-ImagePolicy) merge rule makes sure ImagePolicy for an image cannot override global definitions when merging ClusterImagePolicy and ImagePolicy.
 
-Risk: ClusterImagePolicy with `appliesTo: Default` and `policyType: InsecureAcceptAnything` could weaken Image CR deny-by-default security when `allowedRegistries` is configured.
+Risk: Images already cached on a node are not re-checked against a newly created default policy when containers are created with `imagePullPolicy: IfNotPresent`.
 
-Mitigation: The MCO controller validates and rejects this combination during policy generation, returning an error and setting the MachineConfig Degraded condition. This prevents weakening the deny-by-default security policy established by Image CR `allowedRegistries`.
+Example: A node has `docker.io/library/busybox:1.36` cached. An administrator creates a ClusterImagePolicy with `appliesTo: Default` and `policyType: Reject`. A pod using `docker.io/library/busybox:1.36` with `imagePullPolicy: IfNotPresent` starts successfully on the node with the cached image but is rejected on nodes without the cached image.
+
+Mitigation: When a ClusterImagePolicy with `appliesTo: Default` and `policyType: Reject` exists, the MCO writes a CRI-O drop-in configuration file `/etc/crio/crio.conf.d/<nn>-signature-policy.conf` containing `signature_policy = "/etc/containers/policy.json"`. This causes CRI-O to re-check cached images against the policy at container creation time, ensuring consistent policy enforcement regardless of whether the image is cached. This approach works because CRI-O's create-time policy check runs whenever the `signature_policy` option is set.
 
 ### Drawbacks
+
+Creating a ClusterImagePolicy with `appliesTo: Default` disables **all** namespace-scoped ImagePolicies cluster-wide, even those that would tighten security. For example, if a cluster administrator creates a deny-by-default policy, namespaces cannot add their own signature verification requirements for specific registries. The only signal to namespace administrators is a `Pending` status condition on their ImagePolicy resources. This trade-off prioritizes preventing namespace administrators from weakening cluster-wide security policies over allowing them to strengthen their namespace's security posture.
+
+### Topology Considerations
+
+#### Hypershift / Hosted Control Planes
+
+ClusterImagePolicy configuration for hosted clusters currently requires management cluster administrator privileges via `NodePool.spec.config`. Hosted cluster administrators cannot configure their own policies. Moving this configuration to `HostedCluster.spec.configuration` to enable hosted cluster administrators to manage policies is tracked in [CNTRLPLANE-531](https://issues.redhat.com/browse/CNTRLPLANE-531).
+
+ImagePolicy (namespace-scoped) is not supported in HyperShift. The `openshift` ClusterImagePolicy is excluded on hosted clusters.
+
+**HyperShift is unsupported for 5.1 Tech Preview.** Resolution of CNTRLPLANE-531 is a dependency for GA.
+
+#### Single Node OpenShift (SNO)
+
+Single Node OpenShift supports ClusterImagePolicy and ImagePolicy through the same MCO reconciliation path as multi-node clusters. Policy changes trigger a CRI-O reload, not a node reboot. The `openshift` ClusterImagePolicy is present.
+
+A ClusterImagePolicy with `appliesTo: Default` and `policyType: Reject` can block cluster upgrades if configured incorrectly. Since SNO has only one node, a blocked payload image leaves the node unable to upgrade with no fallback. Administrators must configure allow policies for OpenShift payload registries (`registry.redhat.io`, `quay.io/openshift-release-dev`) before enabling default Reject.
+
+On SNO, nearly all OpenShift payload images are cached on the node after installation. A default Reject policy added post-install primarily affects new images not yet pulled (user workloads, external operator images, upgrade images), not the existing cached image set.
+
+#### OpenShift Local (CRC)
+
+OpenShift Local includes the ClusterImagePolicy and ImagePolicy CRDs and supports both policy types. However, it does not ship the `openshift` ClusterImagePolicy (the cluster is installed with `OPENSHIFT_INSTALL_EXPERIMENTAL_DISABLE_IMAGE_POLICY=true`, preventing the CVO from creating it). Users must manually create allow policies for OpenShift payload registries before enabling default Reject. The same upgrade risk constraints as SNO apply.
 
 ## Design Details
 
@@ -901,47 +932,62 @@ MCO container runtime config controller can add unit tests and e2e tests.
   - verify the policies from ClusterImagePolicy and ImagePolicy instances merged correctly and the controller writes correct format policy.json
   - verify `policyType: Reject` and `policyType: InsecureAcceptAnything` generate correct policy.json output
   - verify `appliesTo: Default` field maps to `"default"` key in policy.json (not to transport scopes)
-  - verify `appliesTo: Registries` with scopes/registries maps to transport-specific entries in policy.json
+  - verify `appliesTo: Registries` with `scopes` maps to transport-specific entries in policy.json
   - verify CEL validation rules:
     - `policyType: Reject` and `InsecureAcceptAnything` cannot have `publicKey/fulcioCAWithRekor/pki` or `signedIdentity`
-    - when `appliesTo: Default`, both `scopes` and `registries` must be empty
-    - when `appliesTo: Registries` or omitted, either `scopes` or `registries` must be specified
-    - `scopes` and `registries` are mutually exclusive
-  - verify MCO validation prevents `appliesTo: Default` with `policyType: InsecureAcceptAnything` when Image CR has `allowedRegistries` configured
+    - when `appliesTo: Default`, `scopes` must be empty
+    - when `appliesTo: Registries` or omitted, `scopes` must be specified
+    - when `appliesTo: Default`, only `policyType: Reject` is allowed (PublicKey, FulcioCAWithRekor, PKI, and InsecureAcceptAnything are rejected)
 - e2e test:
   - verify the MCO writes configuration to the correct location.
   - test demonstrating that an unsigned image in violation of the signature verification policy is rejected
   - test demonstrating that a Pod with image from docker.io fails when ClusterImagePolicy has `appliesTo: Default` with `policyType: Reject`
   - test demonstrating that a Pod with image from allowed registry succeeds when specific scope has `policyType: InsecureAcceptAnything` and default has `policyType: Reject`
+  - test demonstrating that namespace ImagePolicy is ignored (marked Pending) when a ClusterImagePolicy with `appliesTo: Default` exists, even if the namespace policy would tighten security
+  - test demonstrating that a namespace ImagePolicy with `appliesTo: Default` and `policyType: Reject` successfully rejects pods using images from the cluster's internal registry when no cluster-level default policy exists
+  - test demonstrating that cached images are re-checked against a default Reject policy at container creation time: pull an image to a node, create a ClusterImagePolicy with `appliesTo: Default` and `policyType: Reject`, verify that creating a container with `imagePullPolicy: IfNotPresent` using the cached image is rejected (not allowed to start)
+  - verify that the MCO writes the CRI-O drop-in configuration `/etc/crio/crio.conf.d/<nn>-signature-policy.conf` when a default Reject policy exists
+  - test demonstrating that creating a ClusterImagePolicy with `appliesTo: Default` and `policyType: PublicKey` is rejected at admission with a CEL validation error
+  - test demonstrating that when Image CR has `allowedRegistries` configured, a namespace ImagePolicy with `appliesTo: Default` and `policyType: InsecureAcceptAnything` is marked Pending and does not weaken the deny-by-default policy
+  - test demonstrating that creating a ClusterImagePolicy with `appliesTo: Default` and `policyType: Reject` without allowing payload repositories causes the ClusterImagePolicy to be marked Pending with an error message indicating which repository would be blocked
+
+**Note:** Tests using default Reject policies must include companion ClusterImagePolicies allowing payload repositories (extracted from the release image at runtime), `registry.redhat.io`, and the internal registry to prevent locking out the cluster.
 
 
 ### Graduation Criteria
 
-Before GA, validation will be implemented to make sure that scopes cannot be committed to an ImagePolicy that are under the scope of a ClusterImagePolicy, this will prevent conflicts between cluster scoped and namespace scoped policy and prevent namespaces attempting to override the global policy.
+#### OpenShift 5.1 (Current Phase)
 
-Additionally, it will be validated that neither an ImagePolicy nor ClusterImagePolicy sets a scope that could conflict with pulling from an OpenShift image payload repository.
+The `ImagePolicyDenyByDefault` feature gate is available in `TechPreviewNoUpgrade` and `DevPreviewNoUpgrade` feature sets. This includes:
+- The `appliesTo` field to specify default vs registry-specific policies
+- The `Reject` and `InsecureAcceptAnything` policy types
+- CEL validation rules that reference feature-gated fields
 
-#### Dev Preview -> Tech Preview
+The base ClusterImagePolicy and ImagePolicy CRDs remain GA (config.openshift.io/v1) for signature verification use cases with the original three policy types (`PublicKey`, `FulcioCAWithRekor`, `PKI`).
 
-- Ability to utilize the enhancement end to end
-- End user documentation, relative API stability
-- Sufficient test coverage
-- Gather feedback from users rather than just developers
-- Enumerate service level indicators (SLIs), expose SLIs as metrics
-- Write symptoms-based alerts for the component(s)
+#### Promotion to Default Feature Set
 
-#### Tech Preview -> GA
+The `ImagePolicyDenyByDefault` feature gate can be promoted to the `Default` feature set when it meets the openshift/api promotion bar:
+- At least five e2e tests tagged `[OCPFeatureGate:ImagePolicyDenyByDefault]`
+- Each test runs 14+ times per platform (x86_64, aarch64, ppc64le, s390x)
+- 95%+ pass rate across all platforms
+- No known critical bugs or security issues
 
-- More testing (upgrade, downgrade, scale)
-- Sufficient time for feedback
-- Available by default
-- Backhaul SLI telemetry
-- Document SLOs for the component
-- Conduct load testing
-- User facing documentation created in [openshift-docs](https://github.com/openshift/openshift-docs/)
+#### Before GA
 
-**For non-optional features moving to GA, the graduation criteria must include
-end to end tests.**
+The following items must be completed before the deny-by-default functionality can graduate to GA:
+
+1. **Payload repository protection:** MCO validation that ensures ClusterImagePolicies with `appliesTo: Default` and `policyType: Reject` cannot block OpenShift payload repositories. When an `appliesTo: Default` with `policyType: Reject` policy exists, the MCO must check that the repositories of the release image, RHEL CoreOS, and RHEL CoreOS extensions (`ControllerConfig.Spec.ReleaseImage`, `BaseOSContainerImage`, `BaseOSExtensionsContainerImage`) are each covered by a non-`Reject` scope from some ClusterImagePolicy. If any payload repository is not covered, the MCO must not roll out the new `policy.json`, report the error in logs, and mark the ClusterImagePolicy as Pending with the uncovered repositories (e.g., `default Reject would block payload repo quay.io/openshift-release-dev/ocp-v4.0-art-dev; add a ClusterImagePolicy scope that covers it`). This validation follows the same pattern as the existing `blockedRegistries` check. Signed-release clusters pass automatically because the `openshift` ClusterImagePolicy covers these repositories. CI/QE clusters on unsigned releases and OKD clusters get a clear error instead of nodes that cannot pull payload images.
+
+2. **Cached image re-checking:** MCO must write CRI-O configuration to ensure cached images are re-checked against default policies at container creation time.
+
+3. **User documentation:** Complete user-facing documentation in [openshift-docs](https://github.com/openshift/openshift-docs/) covering:
+   - How to configure deny-by-default policies
+   - Required allow-lists for OpenShift payload repositories
+   - Behavior when cluster defaults disable namespace policies
+   - Topology-specific limitations (HyperShift, OpenShift Local)
+
+4. **Sufficient time for feedback:** Gather feedback from Tech Preview users on usability, performance impact, and edge cases.
 
 #### Removing a deprecated feature
 
@@ -952,7 +998,7 @@ Not applicable.
 Upgrade expectations:
 - In order to use ClusterImagePolicy and ImagePolicy, an existing cluster will have to make an upgrade to the version that the `ClusterImagePolicy` and `ImagePolicy` CRDs are available.
 - If the existing cluster manages `/etc/containers/policy.json` via the MachineConfig, the configuration will continue to work if no new `ClusterImagePolicy` or `ImagePolicy` resources created during the upgrade. If `ImagePolicy` resources created and resulting `/path/to/policies/<NAMESPACE>.json` exists, CRI-O will use the config from `/path/to/policies/<NAMESPACE>.json`.
-- **Deny-by-default support**: The addition of `Reject` and `InsecureAcceptAnything` to the `policyType` enum, and the `appliesTo` field are backward compatible. Existing ClusterImagePolicy and ImagePolicy CRs using `policyType: PublicKey`, `policyType: FulcioCAWithRekor`, or `policyType: PKI` with the `scopes` field continue to work without modification. When `appliesTo` is omitted, it defaults to `Registries` for backward compatibility. The new policy types and `appliesTo: Default` are only used when administrators explicitly configure them.
+- **Deny-by-default support**: When the `ImagePolicyDenyByDefault` feature gate is not enabled, existing ClusterImagePolicy and ImagePolicy CRs using `policyType: PublicKey`, `policyType: FulcioCAWithRekor`, or `policyType: PKI` with the `scopes` field continue to work without modification. When the feature gate is enabled, the `appliesTo` field becomes available and defaults to `Registries` when omitted for backward compatibility. The new policy types (`Reject`, `InsecureAcceptAnything`) and `appliesTo: Default` are only available when the feature gate is enabled.
 
 Downgrade expectations:
 - Not applicable.
